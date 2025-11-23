@@ -119,7 +119,7 @@ def load_dataset(config: DatasetConfig) -> List[Dict]:
     elif config["name"] == "simpleqa":
         return load_simpleqa_data(num_examples, shuffle, local_path)
     elif config["name"] == "healthbench":
-        subset = config.get("subset", "all")
+        subset = config.get("subset", "all") or "all"
         return load_healthbench_data(subset, num_examples, shuffle, local_path)
     elif config["name"] == "researchqa":
         return load_researchqa_data(num_examples, shuffle)
@@ -397,7 +397,9 @@ def load_researchqa_data(
         List of ResearchQA examples
     """
     dataset_repo = SUPPORTED_TASKS["researchqa"]
-    data = datasets.load_dataset(dataset_repo, split="test")
+    data = datasets.load_dataset(
+        dataset_repo, split="test", revision="87cdd81df0c5ea96de293859233e8e64dac3d168"
+    )
 
     # Try to load official subset IDs if available
     with tempfile.TemporaryDirectory() as temp_dir:
