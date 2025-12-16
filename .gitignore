@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Cache and logs
+.cache-*/
+uv.lock
+import
+PY
+eval_output/
