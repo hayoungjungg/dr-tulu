@@ -1,8 +1,12 @@
 import asyncio
+import atexit
 import inspect
 import json
 import logging
 import os
+import signal
+import subprocess
+import weakref
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import (
@@ -17,6 +21,16 @@ from typing import (
     TypeVar,
     Union,
 )
+
+# Global registry for cleanup at exit
+_active_workflows: "weakref.WeakSet[BaseWorkflow]" = weakref.WeakSet()
+
+
+@atexit.register
+def _cleanup_all_workflows():
+    for workflow in list(_active_workflows):
+        workflow.cleanup_launched_processes()
+
 
 import litellm
 import typer
@@ -170,6 +184,7 @@ class BaseWorkflow(ABC):
         configuration: Optional[
             Union[BaseWorkflowConfiguration, Dict[str, Any], str]
         ] = None,
+        skip_service_check: bool = False,
         **overrides: Any,
     ) -> None:
         """
@@ -180,9 +195,16 @@ class BaseWorkflow(ABC):
                 - Pydantic configuration instance
                 - Dictionary of configuration values
                 - String path to a YAML file OR a YAML content string
+            skip_service_check: If True, skip checking/launching required services
             overrides: Keyword overrides to apply on top of the configuration
         """
         self.configuration = self._build_configuration(configuration, **overrides)
+        self._launched_processes: List[subprocess.Popen] = []
+        _active_workflows.add(self)
+
+        if not skip_service_check:
+            self.before_launch_check()
+
         self.setup_components()
 
     # ---- Configuration helpers ----
@@ -358,6 +380,31 @@ class BaseWorkflow(ABC):
         return results
 
     # ---- Lifecycle hooks ----
+
+    def before_launch_check(self) -> None:
+        """
+        Check if required services are running and optionally launch them.
+
+        Override this method in subclasses to implement custom service checks.
+        Default implementation does nothing.
+        """
+        pass
+
+    def cleanup_launched_processes(self) -> None:
+        """Clean up any processes launched during service checks."""
+        for process in self._launched_processes:
+            if process and process.poll() is None:
+                try:
+                    if hasattr(os, "setsid"):
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    else:
+                        process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    if hasattr(os, "setsid"):
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    else:
+                        process.kill()
 
     @abstractmethod
     def setup_components(self) -> None:
@@ -1201,6 +1248,11 @@ class BaseWorkflow(ABC):
                 "--ui-mode",
                 help="UI mode to use",
             ),
+            dev_url: Optional[str] = typer.Option(
+                None,
+                "--dev-url",
+                help="URL of the development server (e.g., 'http://localhost:3000'). Required if ui_mode is 'proxy'",
+            ),
             config_file: Optional[str] = typer.Option(
                 None,
                 "--config",
@@ -1270,14 +1322,42 @@ class BaseWorkflow(ABC):
             cls.__logger__.info("Workflow initialized successfully")
 
             # Create FastAPI app
-            fastapi_app = create_app(workflow, ui_mode=ui_mode, password=password)
+            fastapi_app = create_app(
+                workflow, ui_mode=ui_mode, password=password, dev_url=dev_url
+            )
 
             # Start server
-            cls.__logger__.info(f"Starting server at http://{host}:{port}")
+            url = (
+                f"http://localhost:{port}"
+                if host == "0.0.0.0"
+                else f"http://{host}:{port}"
+            )
+            cls.__logger__.info(f"Starting server at {url}")
             if password:
                 cls.__logger__.warning("🔒 Password authentication is enabled")
-            cls.__logger__.info(f"SSE endpoint: http://{host}:{port}/chat/stream")
-            cls.__logger__.info(f"Health check: http://{host}:{port}/health")
+            cls.__logger__.info(f"SSE endpoint: {url}/chat/stream")
+            cls.__logger__.info(f"Health check: {url}/health")
+
+            # Setup browser opening on startup
+            import threading
+            import time
+            import webbrowser
+
+            def open_browser():
+                time.sleep(1.5)  # Wait for server to start
+                cls.__logger__.info(f"\n{'='*60}")
+                cls.__logger__.info(f"🌐 UI is available at: {url}")
+                cls.__logger__.info(f"{'='*60}\n")
+                try:
+                    webbrowser.open(url)
+                    cls.__logger__.info("✓ Browser opened automatically")
+                except Exception as e:
+                    cls.__logger__.info(f"⚠ Could not open browser automatically: {e}")
+                    cls.__logger__.info(f"Please open {url} in your browser manually")
+
+            # Start browser opening in background thread
+            browser_thread = threading.Thread(target=open_browser, daemon=True)
+            browser_thread.start()
 
             uvicorn.run(fastapi_app, host=host, port=port)
 

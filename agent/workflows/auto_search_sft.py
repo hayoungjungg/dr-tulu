@@ -19,7 +19,17 @@ from dr_agent.tool_interface.mcp_tools import (
     SerperBrowseTool,
     SerperSearchTool,
 )
+from dr_agent.utils import (
+    check_port,
+    extract_port_from_url,
+    launch_mcp_server,
+    launch_vllm_server,
+)
 from dr_agent.workflow import BaseWorkflow, BaseWorkflowConfiguration
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm
+from rich.table import Table
 
 # Make sure the .env file is in the root directory of the project rl-rag-mcp/.env
 dotenv.load_dotenv(Path(__file__).parent.parent.parent / ".env")
@@ -172,7 +182,6 @@ class AnswerAgent(BaseAgent):
             "bc_synthetic_depth_one_v2_verified",
             "bc_synthetic_varied_depth_o3_verified",
             "webwalker",
-            "dsqa",
         ]:
             instruction_field_name = "exact_answer"
         elif dataset_name in ["sqav2", "genetic_diseases_qa"]:
@@ -296,6 +305,130 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         crawl4ai_use_ai2_config: bool = False
 
         prompt_version: str = "v20250907"
+
+    def before_launch_check(self) -> None:
+        """Check if MCP server and vLLM servers are running, launch if needed."""
+        cfg = self.configuration
+        if cfg is None:
+            return
+
+        console = Console()
+
+        console.print()
+        console.print(Panel.fit("🔍 Service Check", style="bold cyan"))
+        console.print()
+
+        # Check MCP server
+        mcp_port = getattr(cfg, "mcp_port", 8000)
+        if not check_port(mcp_port):
+            console.print(
+                f"[yellow]⚠[/yellow]  MCP server is not running on port [bold]{mcp_port}[/bold]"
+            )
+            if Confirm.ask("Launch MCP server?"):
+                process = launch_mcp_server(mcp_port, self.logger)
+                if process:
+                    self._launched_processes.append(process)
+                    console.print(
+                        f"[green]✓[/green]  MCP server launched on port {mcp_port}"
+                    )
+                else:
+                    console.print(
+                        "[red]✗[/red]  Failed to start MCP server", style="bold red"
+                    )
+                    raise RuntimeError(
+                        "Failed to start MCP server. Please launch it manually."
+                    )
+            else:
+                console.print("[red]✗[/red]  MCP server is required", style="bold red")
+                raise RuntimeError(
+                    "MCP server is required. Please launch it manually or allow automatic launch."
+                )
+        else:
+            console.print(
+                f"[green]✓[/green]  MCP server is running on port [bold]{mcp_port}[/bold]"
+            )
+
+        # Check search agent vLLM server
+        search_base_url = getattr(cfg, "search_agent_base_url", None)
+        if search_base_url:
+            port = extract_port_from_url(search_base_url)
+            if port and not check_port(port):
+                console.print(
+                    f"[yellow]⚠[/yellow]  Search agent vLLM server is not running on port [bold]{port}[/bold]"
+                )
+                search_model = getattr(cfg, "search_agent_model_name", None)
+                if search_model:
+                    if Confirm.ask(
+                        f"Launch vLLM server for [cyan]{search_model}[/cyan] on port {port}?"
+                    ):
+                        process = launch_vllm_server(
+                            search_model, port, gpu_id=0, logger=self.logger
+                        )
+                        if process:
+                            self._launched_processes.append(process)
+                            console.print(
+                                f"[green]✓[/green]  vLLM server launched for {search_model} on port {port}"
+                            )
+                        else:
+                            console.print(
+                                f"[yellow]⚠[/yellow]  Failed to start vLLM server. Manual launch command:"
+                            )
+                            console.print(
+                                f"   [dim]CUDA_VISIBLE_DEVICES=0 vllm serve {search_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                            )
+                    else:
+                        console.print(f"[blue]💡[/blue]  Manual launch command:")
+                        console.print(
+                            f"   [dim]CUDA_VISIBLE_DEVICES=0 vllm serve {search_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                        )
+            elif port:
+                console.print(
+                    f"[green]✓[/green]  Search agent vLLM server is accessible on port [bold]{port}[/bold]"
+                )
+
+        # Check browse agent vLLM server if enabled
+        use_browse_agent = getattr(cfg, "use_browse_agent", False)
+        if use_browse_agent:
+            browse_base_url = getattr(cfg, "browse_agent_base_url", None)
+            if browse_base_url:
+                port = extract_port_from_url(browse_base_url)
+                if port and not check_port(port):
+                    console.print(
+                        f"[yellow]⚠[/yellow]  Browse agent vLLM server is not running on port [bold]{port}[/bold]"
+                    )
+                    browse_model = getattr(cfg, "browse_agent_model_name", None)
+                    if browse_model:
+                        if Confirm.ask(
+                            f"Launch vLLM server for [cyan]{browse_model}[/cyan] on port {port}?"
+                        ):
+                            process = launch_vllm_server(
+                                browse_model, port, gpu_id=1, logger=self.logger
+                            )
+                            if process:
+                                self._launched_processes.append(process)
+                                console.print(
+                                    f"[green]✓[/green]  vLLM server launched for {browse_model} on port {port}"
+                                )
+                            else:
+                                console.print(
+                                    f"[yellow]⚠[/yellow]  Failed to start vLLM server. Manual launch command:"
+                                )
+                                console.print(
+                                    f"   [dim]CUDA_VISIBLE_DEVICES=1 vllm serve {browse_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                                )
+                        else:
+                            console.print(f"[blue]💡[/blue]  Manual launch command:")
+                            console.print(
+                                f"   [dim]CUDA_VISIBLE_DEVICES=1 vllm serve {browse_model} --port {port} --dtype auto --max-model-len 40960[/dim]"
+                            )
+                elif port:
+                    console.print(
+                        f"[green]✓[/green]  Browse agent vLLM server is accessible on port [bold]{port}[/bold]"
+                    )
+
+        console.print()
+        console.print(Panel.fit("✅ Service Check Complete", style="bold green"))
+        console.print()
 
     def setup_components(
         self,
