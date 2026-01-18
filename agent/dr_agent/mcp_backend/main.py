@@ -266,6 +266,7 @@ def serper_google_webpage_search(
         "Geolocation - country code to boost search results whose country of origin matches the parameter value",
     ] = "us",
     hl: Annotated[str, "Host language of user interface"] = "en",
+    page: Annotated[Optional[int], "Page number (1-indexed). If not provided, fetches page 1."] = None,
 ):
     """
     General web search using Google Search (based on Serper.dev API). Perform general web search to find relevant webpages, articles, and online resources.
@@ -278,7 +279,7 @@ def serper_google_webpage_search(
         - relatedSearches: List of related searches
     """
     results = search_serper(
-        query=query, num_results=num_results, search_type="search", gl=gl, hl=hl
+        query=query, num_results=num_results, search_type="search", gl=gl, hl=hl, page=page
     )
 
     return results

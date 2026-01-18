@@ -1,4 +1,8 @@
+import logging
 import os
+import random
+import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Generic, List, Optional, TypeVar, Union
@@ -6,7 +10,7 @@ from typing import Generic, List, Optional, TypeVar, Union
 import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, HttpUrl
-from requests.exceptions import RequestException
+from requests.exceptions import ReadTimeout, RequestException, Timeout, ConnectionError, ConnectTimeout
 
 from ..cache import cached
 from .data_model import (
@@ -15,7 +19,20 @@ from .data_model import (
     SemanticScholarPaperData,
 )
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+logger = logging.getLogger(__name__)
+
+# Try to load .env from multiple possible locations
+env_paths = [
+    ".env",  # Current directory
+    Path(__file__).resolve().parent.parent.parent.parent.parent / ".env",  # cochrane-benchmark/.env
+]
+for env_path in env_paths:
+    if Path(env_path).exists():
+        load_dotenv(env_path)
+        break
+else:
+    # Fallback: try loading from current directory anyway
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 S2_API_KEY = os.getenv("S2_API_KEY")
 TIMEOUT = int(os.getenv("API_TIMEOUT", 10))
@@ -175,6 +192,8 @@ def search_semantic_scholar_snippets(
     offset: int = 0,
     limit: int = 10,
     timeout: int = TIMEOUT,
+    max_retries: int = 5,
+    initial_backoff: float = 1.0,
 ) -> PaperSnippetApiResponse[PaperSnippet]:
     if offset:
         warnings.warn(
@@ -187,18 +206,120 @@ def search_semantic_scholar_snippets(
     ):
         params["paperIds"] = ",".join(query_params.paperIds)
 
-    res = requests.get(
-        f"{S2_GRAPH_API_URL}/snippet/search",
-        params={
-            # "offset": offset,
-            "limit": limit,
-            **params,
-        },
-        headers={"x-api-key": S2_API_KEY} if S2_API_KEY else None,
-        timeout=timeout,
-    )
-    results = res.json()
-    return results
+    # Retry with exponential backoff for 429 errors
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(
+                f"{S2_GRAPH_API_URL}/snippet/search",
+                params={
+                    # "offset": offset,
+                    "limit": limit,
+                    **params,
+                },
+                headers={"x-api-key": S2_API_KEY} if S2_API_KEY else None,
+                timeout=timeout,
+            )
+            
+            # Parse response
+            results = res.json()
+            
+            # Check for 429 errors (both in HTTP status and JSON response)
+            is_rate_limit = False
+            if res.status_code == 429:
+                is_rate_limit = True
+            elif results.get("code") == "429" or "Too Many Requests" in str(results.get("message", "")):
+                is_rate_limit = True
+            
+            if is_rate_limit:
+                if attempt < max_retries - 1:
+                    wait_time = initial_backoff * (2 ** attempt) + random.uniform(10, 15) # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                    logger.warning("Semantic Scholar API rate limit exceeded (429). Waiting %.1f seconds before retry %d/%d...", 
+                                wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Last attempt failed, log and return the error response
+                    logger.error("Semantic Scholar API rate limit error after %d retries. Returning error response.", max_retries)
+                    return results
+            
+            # Check for other HTTP errors
+            if res.status_code != 200:
+                # Retry on server errors (500+) and gateway errors (502, 503, 504)
+                retryable_status_codes = {502, 503, 504}
+                is_server_error = res.status_code >= 500
+                is_retryable = is_server_error or res.status_code in retryable_status_codes
+                
+                if is_retryable and attempt < max_retries - 1:
+                    wait_time = initial_backoff * (2 ** attempt) + random.uniform(10, 15)
+                    logger.warning("Semantic Scholar API error %d. Waiting %.1f seconds before retry %d/%d...", 
+                                res.status_code, wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+                # For non-retryable errors, raise
+                res.raise_for_status()
+            
+            # Success - verify we have a proper response with data field
+            if "data" in results:
+                # Valid response with data
+                return results
+            elif "code" in results and results.get("code") != "429":
+                # Error response that's not a 429, return it
+                return results
+            else:
+                # Response without data field but no error code - might be valid empty response
+                return results
+                
+        except requests.exceptions.HTTPError as e:
+            if e.response and e.response.status_code == 429:
+                if attempt < max_retries - 1:
+                    wait_time = initial_backoff * (2 ** attempt)
+                    logger.warning("Semantic Scholar API HTTP 429 error. Waiting %.1f seconds before retry %d/%d...", 
+                                wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+            # Check if it's a retryable server error
+            if e.response:
+                retryable_status_codes = {502, 503, 504}
+                is_server_error = e.response.status_code >= 500
+                is_retryable = is_server_error or e.response.status_code in retryable_status_codes
+                if is_retryable and attempt < max_retries - 1:
+                    wait_time = initial_backoff * (2 ** attempt) + random.uniform(10, 15)
+                    logger.warning("Semantic Scholar API HTTP error %d. Waiting %.1f seconds before retry %d/%d...", 
+                                e.response.status_code, wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+            # Re-raise if not retryable or if we've exhausted retries
+            raise
+        except (ReadTimeout, Timeout, ConnectTimeout) as e:
+            # Retry on timeout errors
+            if attempt < max_retries - 1:
+                wait_time = initial_backoff * (2 ** attempt)
+                logger.warning("Semantic Scholar API timeout error. Waiting %.1f seconds before retry %d/%d...", 
+                            wait_time, attempt + 1, max_retries)
+                time.sleep(wait_time)
+                continue
+            raise
+        except ConnectionError as e:
+            # Retry on connection errors
+            if attempt < max_retries - 1:
+                wait_time = initial_backoff * (2 ** attempt)
+                logger.warning("Semantic Scholar API connection error. Waiting %.1f seconds before retry %d/%d...", 
+                            wait_time, attempt + 1, max_retries)
+                time.sleep(wait_time)
+                continue
+            raise
+        except RequestException as e:
+            # For other request exceptions, retry as well
+            if attempt < max_retries - 1:
+                wait_time = initial_backoff * (2 ** attempt) + random.uniform(10, 15)
+                logger.warning("Semantic Scholar API request error. Waiting %.1f seconds before retry %d/%d...", 
+                            wait_time, attempt + 1, max_retries)
+                time.sleep(wait_time)
+                continue
+            raise
+    
+    # If we've exhausted all retries, raise an exception
+    raise Exception(f"Semantic Scholar API request failed after {max_retries} retries due to rate limiting")
 
 
 def search_semantic_scholar_bulk_api(

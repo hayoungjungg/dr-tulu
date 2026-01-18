@@ -1,11 +1,19 @@
-# Before running this script, you may need to
-# Launch the mcp server:
-# python -m mcp_agents.mcp_backend.main --port 8000
+#!/bin/bash
+# Batch evaluation script using OpenAI models (via auto_search_sft-oai.yaml)
+#
+# This script runs evaluation tasks using OpenAI models instead of local vLLM servers.
+# The MCP server will be launched automatically by the workflow.
+#
+# Usage:
+#   bash scripts/auto_search-oai.sh
+#
+# Configuration:
+#   Edit the variables below to customize the evaluation
 
-DATEUID=20250902
+# Configuration
 MAX_CONCURRENT=10
-
-SAVE_FOLDER=eval_output/baselines-$DATEUID-gpt4.1
+DATEUID=$(date +%Y%m%d)  # Auto-generate date UID
+SAVE_FOLDER=eval_output/baselines-${DATEUID}-gpt4.1
 MODEL=auto_search_sft
 
 mkdir -p $SAVE_FOLDER
@@ -24,7 +32,7 @@ for task in $TASKS; do
         --max-concurrent $MAX_CONCURRENT \
         --batch-size $MAX_CONCURRENT \
         --use-cache \
-        --config workflows/$MODEL-oai.yaml \
+        --config workflows/${MODEL}-oai.yaml \
         --config-overrides "use_browse_agent=true,search_agent_max_tool_calls=10" \
         --output $SAVE_FOLDER/$MODEL/$task-ablation-reader-max-tool-calls-10.jsonl
 done

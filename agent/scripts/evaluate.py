@@ -4,12 +4,13 @@ Simple evaluation script for generated JSONL data files.
 Auto-detects task type and runs appropriate evaluation.
 
 Usage:
-    python evaluate_results.py <task> <path/to/results.jsonl>
+    python scripts/evaluate.py <task> <path/to/results.jsonl>
 
 Examples:
-    python evaluate_results.py simpleqa eval_output/baselines-20250828/sft_search_generate/simpleqa-ablation.jsonl
-    python evaluate_results.py browsecomp eval_output/baselines-20250828/sft_search_generate/browsecomp-ablation.jsonl
-    python evaluate_results.py healthbench eval_output/baselines-20250828/sft_search_generate/healthbench-ablation.jsonl
+    python scripts/evaluate.py simpleqa eval_output/auto_search_sft/simpleqa.jsonl
+    python scripts/evaluate.py browsecomp eval_output/auto_search_sft/browsecomp.jsonl
+    python scripts/evaluate.py healthbench eval_output/auto_search_sft/healthbench.jsonl
+    python scripts/evaluate.py researchqa eval_output/auto_search_sft/researchqa.jsonl
 """
 import sys
 from pathlib import Path

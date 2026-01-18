@@ -1,10 +1,82 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+# Configure logging for filter messages to appear in console and file
+def setup_mcp_logging(log_dir: Optional[Path] = None) -> Optional[Path]:
+    """Setup file logging for MCP-related actions (search, filtering, browse).
+    
+    Args:
+        log_dir: Directory to write log file. If None, uses 'logs' directory in agent root.
+        
+    Returns:
+        Path to the log file, or None if setup failed.
+    """
+    if log_dir is None:
+        # Use logs directory in agent root
+        agent_root = Path(__file__).parent.parent
+        log_dir = agent_root / "logs"
+    
+    # Create logs directory if it doesn't exist
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create log file with timestamp
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"mcp_actions_{timestamp}.log"
+    
+    # Create file handler with detailed format
+    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(file_formatter)
+    
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    console_handler.setFormatter(console_formatter)
+    
+    # Configure root logger with both handlers
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    root_logger.handlers.clear()
+    
+    # Add both handlers
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    # Configure specific loggers for MCP-related modules
+    mcp_loggers = [
+        'dr_agent.tool_interface.mcp_tools',
+        'dr_agent.filters.cochrane',
+        'dr_agent.filters.base',
+    ]
+    
+    for logger_name in mcp_loggers:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.INFO)
+        logger.propagate = True  # Propagate to root logger
+    
+    return log_file
+
+# Setup logging
+mcp_log_file = setup_mcp_logging()
+if mcp_log_file:
+    print(f"📝 MCP actions will be logged to: {mcp_log_file}")
 
 import dotenv
 from dr_agent.agent_interface import BaseAgent
@@ -19,6 +91,7 @@ from dr_agent.tool_interface.mcp_tools import (
     SerperBrowseTool,
     SerperSearchTool,
 )
+from dr_agent.filters import CochraneResultFilter
 from dr_agent.utils import (
     check_port,
     extract_port_from_url,
@@ -80,6 +153,7 @@ Can you clean the raw webpage text and convert it into a more readable format? Y
 @dataclass
 class SearchAgent(BaseAgent):
     prompt_version: str = "v20250907"
+    use_research_assistant_prompt: bool = False
 
     def prompt(
         self,
@@ -90,6 +164,11 @@ class SearchAgent(BaseAgent):
 
         PROMPT = UNIFIED_TOOL_CALLING_STRUCTURED_PROMPTS[self.prompt_version]
         system_prompt = PROMPT["system_prompt"]
+        
+        # Use Research Assistant prompt if enabled
+        if self.use_research_assistant_prompt:
+            from dr_agent.prompts import RESEARCH_ASSISTANT_PROMPT
+            system_prompt = RESEARCH_ASSISTANT_PROMPT
 
         if dataset_name in [
             "2wiki",
@@ -305,6 +384,14 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         crawl4ai_use_ai2_config: bool = False
 
         prompt_version: str = "v20250907"
+        
+        # Filtering configuration
+        enable_filtering: bool = False
+        filter_title_list: Optional[List[str]] = None
+        filter_title_list_file: Optional[str] = None  # Path to JSON file with titles
+        filter_source_title: Optional[str] = None
+        filter_publication_date: Optional[str] = None
+        use_research_assistant_prompt: bool = False
 
     def before_launch_check(self) -> None:
         """Check if MCP server and vLLM servers are running, launch if needed."""
@@ -325,7 +412,15 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 f"[yellow]⚠[/yellow]  MCP server is not running on port [bold]{mcp_port}[/bold]"
             )
             if Confirm.ask("Launch MCP server?"):
-                process = launch_mcp_server(mcp_port, self.logger)
+                # Get the centralized log file from root logger
+                root_logger = logging.getLogger()
+                mcp_log_file = None
+                for handler in root_logger.handlers:
+                    if isinstance(handler, logging.FileHandler):
+                        mcp_log_file = Path(handler.baseFilename)
+                        break
+                
+                process = launch_mcp_server(mcp_port, self.logger, log_file=mcp_log_file)
                 if process:
                     self._launched_processes.append(process)
                     console.print(
@@ -448,6 +543,118 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
         if getattr(cfg, "mcp_port", None) is not None:
             mcp_port = cfg.mcp_port
 
+        # Create filter if enabled
+        result_filter = None
+        if getattr(cfg, "enable_filtering", False):
+            # Load title list - priority: direct list > JSON file > default JSON file
+            title_list = getattr(cfg, "filter_title_list", None)
+            
+            # If title_list is already a list, use it directly
+            if isinstance(title_list, list):
+                # Use the list as-is (even if empty - don't fall back to file)
+                pass
+            elif isinstance(title_list, str):
+                # If title_list is a string, check if it's a file path
+                if title_list.endswith('.json'):
+                    # Treat as file path - don't use as direct list
+                    title_list = None
+                else:
+                    # Parse comma-separated string into list
+                    title_list = [t.strip().strip('"\'') for t in title_list.split(",") if t.strip()]
+            else:
+                # title_list is None or other type - will load from file
+                title_list = None
+            
+            # Only load from file if no direct title list was provided
+            if title_list is None:
+                title_list_file = getattr(cfg, "filter_title_list_file", None)
+                
+                # Default to cochrane_titles.json in the filters directory if not specified
+                if not title_list_file:
+                    # Try multiple possible locations for the default file
+                    # File is at: dr-tulu/agent/dr_agent/filters/cochrane_titles.json
+                    # This file is at: dr-tulu/agent/workflows/auto_search_sft.py
+                    possible_paths = [
+                        # Relative to workflows directory: workflows -> agent -> dr_agent -> filters
+                        Path(__file__).parent.parent / "dr_agent" / "filters" / "cochrane_titles.json",
+                        # Alternative: workflows -> dr_agent -> filters (if structure is different)
+                        Path(__file__).parent / "dr_agent" / "filters" / "cochrane_titles.json",
+                        # Fallback: try filters directory relative to workflows
+                        Path(__file__).parent.parent / "filters" / "cochrane_titles.json",
+                    ]
+                    
+                    for default_json in possible_paths:
+                        if default_json.exists():
+                            title_list_file = str(default_json)
+                            self.logger.info(f"✅ Found default cochrane_titles.json at: {default_json}")
+                            break
+                    
+                    if not title_list_file:
+                        self.logger.warning(f"⚠️ Default cochrane_titles.json not found in any of these locations:")
+                        for path in possible_paths:
+                            self.logger.warning(f"   - {path} (exists: {path.exists()})")
+                
+                # Load titles from JSON file
+                if title_list_file:
+                    try:
+                        import json
+                        json_path = Path(title_list_file)
+                        if not json_path.is_absolute():
+                            # Try relative to filters directory (multiple possible locations)
+                            possible_dirs = [
+                                Path(__file__).parent.parent / "dr_agent" / "filters",
+                                Path(__file__).parent.parent / "filters",
+                                Path(__file__).parent / "dr_agent" / "filters",
+                            ]
+                            found = False
+                            for filters_dir in possible_dirs:
+                                candidate = filters_dir / title_list_file
+                                if candidate.exists():
+                                    json_path = candidate
+                                    found = True
+                                    break
+                            if not found:
+                                # Use first option as default
+                                json_path = possible_dirs[0] / title_list_file
+                        
+                        if json_path.exists():
+                            with open(json_path, 'r', encoding='utf-8') as f:
+                                title_list = json.load(f)
+                            if isinstance(title_list, list) and len(title_list) > 0:
+                                self.logger.info(f"✅ Loaded {len(title_list)} titles from {json_path}")
+                            else:
+                                self.logger.warning(f"⚠️ Filter title list file is empty or invalid format: {json_path}")
+                                title_list = None
+                        else:
+                            self.logger.warning(f"⚠️ Filter title list file not found: {json_path}")
+                            title_list = None
+                    except Exception as e:
+                        self.logger.error(f"❌ Failed to load filter title list from {title_list_file}: {e}", exc_info=True)
+                        title_list = None
+                else:
+                    self.logger.warning(f"⚠️ Filter title list file not specified and default not found")
+                    title_list = None
+            
+            # Ensure title_list is set (even if None, filter will still work for URL-based filtering)
+            if title_list is None:
+                self.logger.warning("⚠️ No title filter list loaded - filter will only filter by Cochrane URLs")
+            
+            result_filter = CochraneResultFilter(
+                title_filter_list=title_list,
+                source_title=getattr(cfg, "filter_source_title", None),
+                publication_date=getattr(cfg, "filter_publication_date", None),
+            )
+            
+            # Log filter configuration
+            if title_list:
+                self.logger.info(f"✅ Filter configured with {len(title_list)} titles")
+                if hasattr(result_filter, 'title_filter') and result_filter.title_filter:
+                    self.logger.info("✅ Title filter function created successfully")
+                else:
+                    self.logger.warning("⚠️ Title filter function was NOT created - check filter initialization")
+            else:
+                self.logger.info("ℹ️ Filter configured without title list (URL-only filtering)")
+
         # Search and browse tools (MCP-backed) with unified tool parser
         if cfg.search_tool_name == "serper":
             self.search_tool = SerperSearchTool(
@@ -458,6 +665,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
 
             self.search_tool2 = SerperSearchTool(
@@ -468,6 +676,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
         elif cfg.search_tool_name == "s2":
             self.search_tool = SemanticScholarSnippetSearchTool(
@@ -478,6 +687,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
 
             self.search_tool2 = SerperSearchTool(
@@ -488,6 +698,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
         elif cfg.search_tool_name == "s2-only":
             self.search_tool = SemanticScholarSnippetSearchTool(
@@ -498,6 +709,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
 
             self.search_tool2 = SemanticScholarSnippetSearchTool(
@@ -508,6 +720,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
         else:
             raise ValueError(f"Invalid search tool name: {cfg.search_tool_name}")
@@ -521,6 +734,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
         elif cfg.browse_tool_name == "crawl4ai":
             self.browse_tool = Crawl4AIBrowseTool(
@@ -534,6 +748,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 context_chars=cfg.browse_context_char_length,
                 use_docker_version=cfg.crawl4ai_use_docker_version,
                 use_ai2_config=cfg.crawl4ai_use_ai2_config,
+                result_filter=result_filter,
             )
         elif cfg.browse_tool_name == "jina":
             self.browse_tool = JinaBrowseTool(
@@ -543,6 +758,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 transport_type=mcp_transport_type,
                 mcp_executable=mcp_executable,
                 mcp_port=mcp_port,
+                result_filter=result_filter,
             )
         elif cfg.browse_tool_name is None:
             self.browse_tool = NoBrowseTool(
@@ -583,6 +799,7 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
                 client=client,
                 tools=[self.search_tool, self.search_tool2, self.composed_browse_tool],
                 prompt_version=cfg.prompt_version,
+                use_research_assistant_prompt=getattr(cfg, "use_research_assistant_prompt", False),
             )
             self.answer_agent = AnswerAgent(
                 client=client,
@@ -620,6 +837,26 @@ class AutoReasonSearchWorkflow(BaseWorkflow):
 
         # import litellm
         # litellm._turn_on_debug()
+
+        # Reset filtered URLs at the start of a new query
+        # This ensures each query starts with a clean slate for URL-based filtering
+        # (matches sciconbench_code pattern in mcp_client.py line 303)
+        try:
+            # Try sciconbench_code utils first (if available)
+            from mcp_client.utils.utils import reset_filtered_urls
+            reset_filtered_urls()
+            self.logger.debug("✅ Reset filtered URLs at start of new query (sciconbench_code utils)")
+        except ImportError:
+            # Try agent utils as fallback
+            try:
+                from dr_agent.utils.utils import reset_filtered_urls
+                reset_filtered_urls()
+                self.logger.debug("✅ Reset filtered URLs at start of new query (agent utils)")
+            except ImportError:
+                # If utils module not available, skip URL reset (filter will still work)
+                self.logger.debug("ℹ️ URL reset not available (utils module not found)")
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to reset filtered URLs: {e}")
 
         # Set the question for the browse agent
         # TODO: This is a bit hectic and hacky, but it works for now

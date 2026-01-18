@@ -26,6 +26,7 @@ from .base import BaseTool
 from .data_types import Document, DocumentToolOutput, ToolInput, ToolOutput
 from .tool_parsers import LegacyToolCallParser, ToolCallInfo, ToolCallParser
 from .utils import extract_snippet_with_context
+from ..filters.base import BaseResultFilter
 
 SERPER_MAX_QUERY_LENGTH = 2048
 
@@ -171,6 +172,7 @@ class MCPMixin:
                 MCPMixin._max_concurrent_calls
             )
         async with MCPMixin._global_semaphore:
+            mcp_client = None
             try:
                 mcp_client = self.init_mcp_client()
                 async with mcp_client:
@@ -189,7 +191,6 @@ class MCPMixin:
                             return {"data": str(result.content[0])}
                     else:
                         return {"error": "No content in response", "data": []}
-
             except (asyncio.TimeoutError, TimeoutError) as e:
                 error_msg = f"MCP call timed out after {self.timeout} seconds"
                 print(f"Error: {error_msg}")
@@ -424,6 +425,7 @@ class MCPSearchTool(MCPMixin, BaseTool, ABC):
         timeout: int = 60,
         name: Optional[str] = None,
         create_string_output: bool = True,
+        result_filter: Optional[BaseResultFilter] = None,
         **kwargs,
     ):
         super().__init__(
@@ -434,6 +436,7 @@ class MCPSearchTool(MCPMixin, BaseTool, ABC):
             **kwargs,
         )
         self.number_documents_to_search = number_documents_to_search
+        self.result_filter = result_filter
 
     @abstractmethod
     def extract_documents(self, raw_output: Dict[str, Any]) -> List[Document]:
@@ -555,12 +558,108 @@ class MCPSearchTool(MCPMixin, BaseTool, ABC):
                 raw_output=raw_output,
             )
 
+        # Step 5.5: Apply filtering if filter is provided and enabled
+        if self.result_filter and self.result_filter.should_filter_tool(self.get_mcp_tool_name()):
+            tool_name = self.get_mcp_tool_name()
+            
+            # Get requested number of results for logging (matches sciconbench_code)
+            requested_num_results = tool_call_info.parameters.get("num_results") or tool_call_info.parameters.get("limit") if tool_call_info.parameters else None
+            if requested_num_results is None:
+                if tool_name == "semantic_scholar_snippet_search":
+                    requested_num_results = self.number_documents_to_search
+                else:
+                    requested_num_results = self.number_documents_to_search
+            
+            # Determine result key based on tool (matches sciconbench_code)
+            if tool_name == "semantic_scholar_snippet_search":
+                result_key = "data"
+            else:
+                result_key = "organic"
+            
+            # Count results before filtering for logging
+            before_count = len(raw_output.get(result_key, []))
+            fetched_count = before_count
+            
+            logger.info(f"🔍 [FILTER] Applying filter to {tool_name} results (before: {before_count} items)")
+            if tool_name == "semantic_scholar_snippet_search":
+                logger.info(f"   Fetched {fetched_count} results from API")
+            
+            raw_output = self.result_filter.filter(raw_output, tool_name)
+            
+            # Count results after filtering for logging
+            after_count = len(raw_output.get(result_key, []))
+            filtered_items = raw_output.get(result_key, [])
+            
+            filtered_count = before_count - after_count
+            if filtered_count > 0:
+                logger.info(f"✅ [FILTER] Filtered {filtered_count} out of {before_count} results from {tool_name} ({after_count} remaining)")
+            else:
+                logger.info(f"✅ [FILTER] No items filtered from {tool_name} ({after_count} results)")
+            
+            # Log after filtering summary (matches sciconbench_code pattern)
+            if tool_name == "semantic_scholar_snippet_search":
+                logger.info(f"📊 [FILTER] After filtering: {len(filtered_items)} results remaining (requested: {requested_num_results}, fetched: {fetched_count})")
+
         # Step 6: Extract documents for structured output
         documents = self.extract_documents(raw_output)
+        
+        # Log final results that passed filter and will be passed to the model
+        if documents:
+            # Get the filtered items from raw_output (handle both Serper and Semantic Scholar formats)
+            results = raw_output.get("organic", []) or raw_output.get("data", [])
+            if results:
+                tool_name = self.get_mcp_tool_name()
+                logger.info("")
+                logger.info("=" * 80)
+                logger.info("FINAL RESULTS PASSED TO MODEL: %d results (%s)", len(documents), tool_name)
+                logger.info("-" * 80)
+                for idx, item in enumerate(results[:len(documents)], start=1):
+                    if isinstance(item, dict):
+                        # Handle Serper format
+                        if "title" in item and "link" in item:
+                            title = item.get("title", "N/A")
+                            url = item.get("link", "N/A")
+                            date = item.get("date", "")
+                            logger.info("  [%d] %s", idx, title)
+                            logger.info("      URL:  %s", url)
+                            if date:
+                                logger.info("      Date: %s", date)
+                        # Handle Semantic Scholar format
+                        elif "paper" in item:
+                            paper = item.get("paper", {})
+                            title = paper.get("title", "N/A")
+                            snippet = item.get("snippet", {})
+                            snippet_text = snippet.get("text", "") if isinstance(snippet, dict) else ""
+                            logger.info("  [%d] %s", idx, title)
+                            if snippet_text:
+                                logger.info("      Snippet: %s", snippet_text[:100] + ("..." if len(snippet_text) > 100 else ""))
+                        else:
+                            # Fallback: log what we can
+                            logger.info("  [%d] %s", idx, str(item)[:100])
+                        if idx < len(documents):
+                            logger.info("")
+                logger.info("=" * 80)
+                logger.info("")
 
         if not documents:
+            # Check if filtering removed all results
+            error_msg = "No results found for the query."
+            if self.result_filter and self.result_filter.should_filter_tool(self.get_mcp_tool_name()):
+                # Check if we had results before filtering
+                tool_name = self.get_mcp_tool_name()
+                had_results = False
+                
+                # Check if there are any filtered links (indicates we had results that were filtered)
+                # This works for both serper and semantic scholar (matches sciconbench_code)
+                if hasattr(self.result_filter, 'filtered_links') and self.result_filter.filtered_links:
+                    had_results = True
+                
+                if had_results:
+                    error_msg = "No results found after filtering. All results were filtered out."
+                    logger.warning(f"⚠️ [FILTER] All results were filtered out for {tool_name}")
+            
             return self._create_error_output(
-                "No results found for the query.",
+                error_msg,
                 call_id,
                 time.time() - start_time,
                 raw_output=raw_output,
@@ -712,7 +811,7 @@ class SerperSearchTool(MCPSearchTool):
     def get_mcp_tool_name(self) -> str:
         return "serper_google_webpage_search"
 
-    def get_mcp_params(self, tool_call_info: ToolCallInfo) -> Dict[str, Any]:
+    def get_mcp_params(self, tool_call_info: ToolCallInfo, page: Optional[int] = None) -> Dict[str, Any]:
         """Build parameters for Serper API"""
         # Start with default parameters
         params = {
@@ -726,8 +825,259 @@ class SerperSearchTool(MCPSearchTool):
                 params["num_results"] = int(tool_call_info.parameters["num_results"])
             except ValueError:
                 pass  # Keep default if conversion fails
+        
+        # Add page parameter if provided (for pagination)
+        if page is not None and page > 1:
+            params["page"] = page
 
         return params
+
+    async def __call__(
+        self, tool_input: Union[str, ToolInput, ToolOutput]
+    ) -> DocumentToolOutput:
+        """Override to add pagination support when filtering is enabled"""
+        # If filtering is enabled, use paginated search
+        # CRITICAL: Always use pagination when filtering is enabled to ensure all results are filtered
+        tool_name = self.get_mcp_tool_name()
+        if (self.result_filter and 
+            self.result_filter.should_filter_tool(tool_name)):
+            logger.debug("Filtering enabled for %s, using paginated search", tool_name)
+            return await self._execute_paginated_search(tool_input)
+        else:
+            # Use parent implementation (no pagination)
+            # This should only happen when filtering is disabled
+            if self.result_filter:
+                logger.warning("Filter is set but should_filter_tool(%s) returned False - using non-paginated path", tool_name)
+            return await super().__call__(tool_input)
+    
+    async def _execute_paginated_search(
+        self, tool_input: Union[str, ToolInput, ToolOutput]
+    ) -> DocumentToolOutput:
+        """Execute paginated search with filtering to ensure we get enough results"""
+        # Fetch MCP schema on first call
+        if self._mcp_tool_schema is None:
+            await self._fetch_mcp_tool_schema()
+
+        call_id = self._generate_call_id()
+        start_time = time.time()
+
+        # Step 1: Preprocess input
+        tool_call_info = self.preprocess_input(tool_input)
+        if not tool_call_info:
+            return self._create_error_output(
+                "No valid query found in tool call.",
+                call_id,
+                time.time() - start_time,
+            )
+
+        # Get requested number of results
+        requested_num_results = tool_call_info.parameters.get("num_results") if tool_call_info.parameters else None
+        if requested_num_results is None:
+            requested_num_results = self.number_documents_to_search
+        else:
+            try:
+                requested_num_results = int(requested_num_results)
+            except (ValueError, TypeError):
+                requested_num_results = self.number_documents_to_search
+
+        # Fetch pages incrementally until we have enough filtered results
+        all_filtered_items = []
+        all_organic = []
+        knowledge_graph = None
+        people_also_ask = []
+        related_searches = []
+        search_parameters = None
+        page = 1
+        total_fetched = 0
+
+        while len(all_filtered_items) < requested_num_results:
+            # Create params for this page
+            params = self.get_mcp_params(tool_call_info, page=page)
+            
+            # Fetch this page
+            logger.info("")
+            logger.info("PAGINATION: Fetching page %d (have %d/%d filtered results)", page, len(all_filtered_items), requested_num_results)
+            raw_output = await self._execute_mcp_call(self.get_mcp_tool_name(), params)
+            
+            # Check for errors
+            if error := raw_output.get("error"):
+                if page == 1:
+                    # Error on first page - return error
+                    return self._create_error_output(
+                        f"Query failed: {error}",
+                        call_id,
+                        time.time() - start_time,
+                        raw_output=raw_output,
+                    )
+                else:
+                    # Error on subsequent page - break and use what we have
+                    logger.warning("  Page %d: Error - %s. Using results from previous pages.", page, error)
+                    break
+            
+            page_organic = raw_output.get("organic", [])
+            if not page_organic:
+                # No more results available
+                logger.info("  Page %d: No more results available (have %d/%d filtered)", page, len(all_filtered_items), requested_num_results)
+                break
+            
+            # If API returns fewer results than requested, it means there are no more results
+            if len(page_organic) < requested_num_results:
+                logger.info("  Page %d: Returned %d results (less than requested %d), stopping (have %d/%d filtered)", 
+                           page, len(page_organic), requested_num_results, len(all_filtered_items), requested_num_results)
+                total_fetched += len(page_organic)
+                all_organic.extend(page_organic)
+                
+                # Filter this page's results before breaking
+                filtered_page_result = self.result_filter.filter(raw_output.copy(), self.get_mcp_tool_name())
+                filtered_page_items = filtered_page_result.get("organic", [])
+                all_filtered_items.extend(filtered_page_items)
+                break
+            
+            total_fetched += len(page_organic)
+            all_organic.extend(page_organic)
+            
+            # Store metadata from first page
+            if page == 1:
+                knowledge_graph = raw_output.get("knowledgeGraph")
+                people_also_ask = raw_output.get("peopleAlsoAsk", [])
+                related_searches = raw_output.get("relatedSearches", [])
+                search_parameters = raw_output.get("searchParameters", {})
+            
+            # Filter this page's results BEFORE adding to all_filtered_items
+            # This ensures we only count filtered results toward our goal
+            filtered_page_result = self.result_filter.filter(raw_output.copy(), self.get_mcp_tool_name())
+            filtered_page_items = filtered_page_result.get("organic", [])
+            
+            # Only add filtered items to our collection
+            all_filtered_items.extend(filtered_page_items)
+            
+            logger.info("  Page %d: Fetched %d results → %d passed filter (total: %d/%d)", 
+                       page, len(page_organic), len(filtered_page_items), len(all_filtered_items), requested_num_results)
+            
+            # Check if we have enough filtered results NOW (after filtering this page)
+            if len(all_filtered_items) >= requested_num_results:
+                logger.info("  ✓ Reached target of %d filtered results after page %d", requested_num_results, page)
+                break
+            
+            page += 1
+        
+        # Build final result with filtered items (limit to requested number)
+        # IMPORTANT: Only use filtered items - never return unfiltered results
+        # Double-check: ensure we never accidentally include unfiltered items
+        final_items = all_filtered_items[:requested_num_results]
+        
+        # DEFENSIVE CHECK: Verify all items in final_items are actually filtered
+        # Re-filter the final items as a safety check (should be a no-op if filtering worked correctly)
+        if self.result_filter and len(final_items) > 0:
+            # Create a copy of items for safety check (list of dicts, so we need list comprehension)
+            temp_check = {"organic": [item.copy() if isinstance(item, dict) else item for item in final_items]}
+            re_filtered = self.result_filter.filter(temp_check, self.get_mcp_tool_name())
+            re_filtered_items = re_filtered.get("organic", [])
+            if len(re_filtered_items) != len(final_items):
+                removed_count = len(final_items) - len(re_filtered_items)
+                logger.warning("Safety check FAILED: Re-filtering removed %d unfiltered items! This indicates a bug.", removed_count)
+                # Log the removed items for debugging (compare by URL/title since dict comparison won't work)
+                removed_urls = set()
+                for item in final_items:
+                    if isinstance(item, dict):
+                        url = item.get("link", "")
+                        title = item.get("title", "")
+                        removed_urls.add((url, title))
+                for item in re_filtered_items:
+                    if isinstance(item, dict):
+                        url = item.get("link", "")
+                        title = item.get("title", "")
+                        removed_urls.discard((url, title))
+                # Log removed items
+                for url, title in list(removed_urls)[:5]:  # Log first 5
+                    logger.warning("Removed item - Title: %s, URL: %s", title[:80], url[:80])
+                final_items = re_filtered_items[:requested_num_results]
+            else:
+                logger.debug("Safety check passed: All %d final items are properly filtered", len(final_items))
+        
+        # Update position indices globally across all pages
+        for idx, item in enumerate(final_items, start=1):
+            if isinstance(item, dict) and "position" in item:
+                item["position"] = idx
+        
+        # Build final raw_output - ONLY include filtered items
+        # CRITICAL: Never use all_organic (unfiltered) - only use all_filtered_items
+        final_raw_output = {
+            "organic": final_items,  # Only filtered items, never raw/unfiltered
+        }
+        if knowledge_graph:
+            final_raw_output["knowledgeGraph"] = knowledge_graph
+        if people_also_ask:
+            final_raw_output["peopleAlsoAsk"] = people_also_ask
+        if related_searches:
+            final_raw_output["relatedSearches"] = related_searches
+        if search_parameters:
+            final_raw_output["searchParameters"] = search_parameters
+        
+        logger.info("")
+        logger.info("PAGINATION SUMMARY:")
+        logger.info("  Total fetched:    %d results across %d page(s)", total_fetched, page - 1)
+        logger.info("  Filtered results: %d returned (requested: %d)", len(final_items), requested_num_results)
+        
+        # Extract documents from final results (which should only contain filtered items)
+        documents = self.extract_documents(final_raw_output)
+        
+        # Log final results that passed filter and will be passed to the model
+        if documents:
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info("FINAL RESULTS PASSED TO MODEL: %d results", len(documents))
+            logger.info("-" * 80)
+            for idx, item in enumerate(final_items[:len(documents)], start=1):
+                title = item.get("title", "N/A")
+                url = item.get("link", "N/A")
+                date = item.get("date", "")
+                logger.info("  [%d] %s", idx, title)
+                logger.info("      URL:  %s", url)
+                if date:
+                    logger.info("      Date: %s", date)
+                if idx < len(documents):
+                    logger.info("")
+            logger.info("=" * 80)
+            logger.info("")
+        else:
+            logger.warning("")
+            logger.warning("=" * 80)
+            logger.warning("WARNING: No results passed filter - no documents will be passed to model")
+            logger.warning("=" * 80)
+            logger.warning("")
+        
+        if not documents:
+            error_msg = "No results found after filtering across all pages."
+            logger.warning("All %d results across %d page(s) were filtered out", total_fetched, page - 1)
+            return self._create_error_output(
+                error_msg,
+                call_id,
+                time.time() - start_time,
+                raw_output=final_raw_output,
+            )
+        
+        # Create content from documents
+        content_parts = []
+        for doc in documents:
+            content_parts.append(doc.stringify())
+        content = "\n\n".join(content_parts)
+
+        return DocumentToolOutput(
+            tool_name=self.name,
+            output=content if self.create_string_output else "",
+            called=True,
+            error="",
+            timeout=False,
+            runtime=time.time() - start_time,
+            call_id=call_id,
+            raw_output=final_raw_output,
+            documents=documents,
+            query=tool_call_info.content,
+            input_params=(
+                tool_call_info.parameters if tool_call_info.parameters else None
+            ),
+        )
 
     def extract_documents(self, raw_output: Dict[str, Any]) -> List[Document]:
         """Extract documents from Serper response"""
@@ -819,6 +1169,7 @@ class MCPBrowseTool(MCPMixin, BaseTool, ABC):
         context_chars: int = 2000,
         name: Optional[str] = None,
         create_string_output: bool = True,
+        result_filter: Optional[BaseResultFilter] = None,
         **kwargs,
     ):
         super().__init__(
@@ -831,6 +1182,7 @@ class MCPBrowseTool(MCPMixin, BaseTool, ABC):
         self.max_pages_to_fetch = max_pages_to_fetch
         self.use_localized_snippets = use_localized_snippets
         self.context_chars = context_chars
+        self.result_filter = result_filter
 
     def _create_error_output(
         self,
@@ -939,7 +1291,42 @@ class MCPBrowseTool(MCPMixin, BaseTool, ABC):
             content=url, parameters=kwargs, start_pos=0, end_pos=len(url)
         )
         params = self.get_mcp_params(url_tool_call)
-        raw_output = await self._execute_mcp_call(self.get_mcp_tool_name(), params)
+        tool_name = self.get_mcp_tool_name()
+        raw_output = await self._execute_mcp_call(tool_name, params)
+        
+        # Apply filtering if filter is provided and enabled
+        if self.result_filter and self.result_filter.should_filter_tool(tool_name):
+            # Check if content exists before filtering
+            has_content_before = False
+            content_length_before = 0
+            if isinstance(raw_output, dict) and raw_output.get("success", False):
+                content = raw_output.get("content", "")
+                has_content_before = bool(content)
+                content_length_before = len(content) if content else 0
+            
+            logger.info(f"🔍 [FILTER] Applying filter to {tool_name} content for URL: {url[:80]}...")
+            logger.info(f"   Content before filtering: {'present' if has_content_before else 'empty'} ({content_length_before} chars)")
+            
+            raw_output = self.result_filter.filter(raw_output, tool_name)
+            
+            # Check if content was filtered out
+            has_content_after = False
+            content_length_after = 0
+            if isinstance(raw_output, dict) and raw_output.get("success", False):
+                content = raw_output.get("content", "")
+                has_content_after = bool(content)
+                content_length_after = len(content) if content else 0
+            
+            if has_content_before and not has_content_after:
+                logger.info(f"❌ [FILTER] Content filtered out from {tool_name} (URL: {url[:80]}...)")
+                # Log that Jina content was filtered (matches sciconbench_code)
+                if tool_name == "jina_fetch_webpage_content":
+                    logger.info("   Jina content filtered out")
+            elif has_content_before and has_content_after:
+                logger.info(f"✅ [FILTER] Content passed filter for {tool_name} ({content_length_after} chars remaining)")
+            else:
+                logger.info(f"✅ [FILTER] No filtering applied to {tool_name} (content was already empty or filter conditions not met)")
+        
         return url, raw_output
 
     async def _fetch_webpages_parallel(
